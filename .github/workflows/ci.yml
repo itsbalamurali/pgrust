@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref (e.g. rapid PR pushes).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the build hermetic; the workspace vendors its own Postgres share tree.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Formatting — cheap, fast feedback, no system deps required.
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust (stable + rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+  # ---------------------------------------------------------------------------
+  # Clippy — advisory only for now. `continue-on-error` keeps the job from
+  # failing the run while the workspace is brought up to a clean lint baseline;
+  # flip it off (or drop it) to start enforcing.
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: clippy (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libicu-dev libssl-dev libldap2-dev libpam0g-dev
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+  # ---------------------------------------------------------------------------
+  # Build the pgrust `postgres` binary and run the Postgres regression suite
+  # against it, exactly as documented in the README.
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    name: build + regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install build + client dependencies
+        run: |
+          set -eux
+          # PGDG apt repo — provides the PostgreSQL 18 `psql` client the
+          # regression runner needs (its one external dependency).
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo wget -qO /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libicu-dev libssl-dev libldap2-dev libpam0g-dev \
+            postgresql-client-18
+
+      - name: Build release binary
+        env:
+          # Bake the vendored Postgres 18.3 share tree (tz data + bootstrap
+          # templates) into the binary, matching the README build recipe.
+          PGRUST_PGSHAREDIR: ${{ github.workspace }}/vendor/postgres-18.3/share
+        run: cargo build --release --locked --bin postgres
+
+      - name: Run regression tests
+        env:
+          PGRUST_BIN: ${{ github.workspace }}/target/release/postgres
+        run: |
+          # The PGDG client installs psql at /usr/lib/postgresql/18/bin.
+          export PATH="/usr/lib/postgresql/18/bin:$PATH"
+          scripts/run-regression
+
+      - name: Upload regression diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-output
+          path: |
+            **/regression.diffs
+            **/regression.out
+          if-no-files-found: ignore
+          retention-days: 7
