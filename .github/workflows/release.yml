@@ -16,9 +16,9 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# Default to read-only; each job below elevates only what it needs.
 permissions:
-  contents: write # create the GitHub Release + upload assets
-  packages: write # push images to GHCR
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,10 +34,14 @@ jobs:
   docker:
     name: docker image
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push images to GHCR
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Detect Docker Hub credentials
         id: dockerhub
@@ -51,6 +55,29 @@ jobs:
             echo "::notice::Docker Hub secrets not set — pushing to GHCR only."
           fi
 
+      # Derive the image tags from the *resolved* release tag rather than from
+      # github.ref, so a workflow_dispatch rebuild (github.ref is the branch,
+      # not the tag) still emits the right semver tags. The floating major /
+      # major.minor / latest tags are applied only for stable (non-prerelease)
+      # versions. TAG comes in via env to keep it out of the shell text.
+      - name: Resolve release version
+        id: ver
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          ver="${TAG#refs/tags/}"        # tolerate a full ref
+          ver="${ver#v}"                 # v0.2.0 -> 0.2.0
+          major="${ver%%.*}"
+          rest="${ver#*.}"; minor="${rest%%.*}"
+          case "$ver" in *-*) stable=false ;; *) stable=true ;; esac
+          {
+            echo "version=${ver}"
+            echo "major=${major}"
+            echo "majorminor=${major}.${minor}"
+            echo "stable=${stable}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Docker metadata (tags + labels)
         id: meta
         uses: docker/metadata-action@v6
@@ -58,11 +85,12 @@ jobs:
           images: |
             ghcr.io/${{ github.repository }}
             ${{ steps.dockerhub.outputs.images }}
+          flavor: latest=false
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable=${{ !contains(github.ref, '-') }}
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=${{ steps.ver.outputs.majorminor }},enable=${{ steps.ver.outputs.stable == 'true' }}
+            type=raw,value=${{ steps.ver.outputs.major }},enable=${{ steps.ver.outputs.stable == 'true' }}
+            type=raw,value=latest,enable=${{ steps.ver.outputs.stable == 'true' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -100,6 +128,8 @@ jobs:
   binaries:
     name: binary (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -112,6 +142,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -120,6 +151,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          # Read-only: release runs accept a user-supplied tag input, so don't
+          # let them write back to the shared cache (cache-poisoning vector).
+          save-if: false
 
       - name: Install build dependencies
         run: |
@@ -136,10 +170,16 @@ jobs:
 
       - name: Package artifact
         id: package
+        env:
+          # Pass the (attacker-controllable) tag input through the environment
+          # instead of interpolating it into the shell text — avoids template
+          # injection via shell metacharacters in the tag.
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -eux
-          version="${{ github.event.inputs.tag || github.ref_name }}"
-          name="pgrust-${version}-${{ matrix.target }}"
+          version="${TAG}"
+          name="pgrust-${version}-${TARGET}"
           staging="dist/${name}"
           mkdir -p "${staging}/bin" "${staging}/share"
           cp target/release/postgres "${staging}/bin/pgrust-postgres"
@@ -164,6 +204,8 @@ jobs:
     name: github release
     needs: [docker, binaries]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release + upload assets
     steps:
       - name: Download binary artifacts
         uses: actions/download-artifact@v8

@@ -29,6 +29,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Install Rust (stable + rustfmt)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -47,6 +49,8 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust (stable + clippy)
         uses: dtolnay/rust-toolchain@stable
@@ -76,6 +80,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -109,18 +115,25 @@ jobs:
       - name: Run regression tests
         env:
           PGRUST_BIN: ${{ github.workspace }}/target/release/postgres
+          # Pin the runner's output dir (it otherwise defaults to a throwaway
+          # mktemp dir) so the failure step below can find and upload the
+          # per-test *.out results and server logs it writes there.
+          OUTDIR: ${{ github.workspace }}/regression-output
         run: |
           # The PGDG client installs psql at /usr/lib/postgresql/18/bin.
           export PATH="/usr/lib/postgresql/18/bin:$PATH"
           scripts/run-regression
 
-      - name: Upload regression diffs on failure
+      - name: Upload regression output on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: regression-output
+          # run-regression writes <test>.out results plus initdb/postmaster logs
+          # into OUTDIR; test diffs are echoed to the job log. Upload everything
+          # except the disposable pgdata under data/.
           path: |
-            **/regression.diffs
-            **/regression.out
+            regression-output/**
+            !regression-output/data/**
           if-no-files-found: ignore
           retention-days: 7
